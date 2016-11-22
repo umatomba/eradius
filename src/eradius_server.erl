@@ -316,7 +316,7 @@ apply_handler_mod(HandlerMod, HandlerArg, Request, NasProp) ->
     try HandlerMod:radius_request(Request, NasProp, HandlerArg) of
         {reply, Reply = #radius_request{cmd = ReplyCmd, attrs = ReplyAttrs, msg_hmac = MsgHMAC, eap_msg = EAPmsg}} ->
             Sender = {NasProp#nas_prop.nas_ip, NasProp#nas_prop.nas_port, Request#radius_request.reqid},
-            EncReply = eradius_lib:encode_reply_request(Request#radius_request{cmd = ReplyCmd, attrs = ReplyAttrs,
+            EncReply = eradius_lib:encode_reply(Request#radius_request{cmd = ReplyCmd, attrs = ReplyAttrs,
                                                                                msg_hmac = Request#radius_request.msg_hmac or MsgHMAC or (size(EAPmsg) > 0),
                                                                                eap_msg = EAPmsg}),
             lager:info(eradius_log:collect_meta(Sender, Reply),"~s",
@@ -324,15 +324,14 @@ apply_handler_mod(HandlerMod, HandlerArg, Request, NasProp) ->
             eradius_log:write_request(Sender, Reply),
             {reply, EncReply,{Request#radius_request.cmd, ReplyCmd}};
         noreply ->
+            lager:error("~s INF: Noreply for request ~p from handler ~p: returned value: ~p", [printable_peer(ServerIP, Port), Request, HandlerArg, noreply]),
             {discard, handler_returned_noreply};
         OtherReturn ->
-            lager:error("~s INF: Unexpected return for request ~p from handler ~p: returned value: ~p",
-            [printable_peer(ServerIP, Port), Request, HandlerArg, OtherReturn]),
+            lager:error("~s INF: Unexpected return for request ~p from handler ~p: returned value: ~p", [printable_peer(ServerIP, Port), Request, HandlerArg, OtherReturn]),
             {discard, {bad_return, OtherReturn}}
     catch
         Class:Reason ->
-            lager:error("~s INF: Handler crashed after request ~p, radius handler class: ~p, reason of crash: ~p, stacktrace: ~p",
-                [printable_peer(ServerIP, Port), Request, Class, Reason, erlang:get_stacktrace()]),
+            lager:error("~s INF: Handler crashed after request ~p, radius handler class: ~p, reason of crash: ~p, stacktrace: ~p", [printable_peer(ServerIP, Port), Request, Class, Reason, erlang:get_stacktrace()]),
             {exit, {Class, Reason}}
     end.
 

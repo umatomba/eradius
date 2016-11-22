@@ -1,8 +1,10 @@
 -module(eradius_lib).
--export([del_attr/2, get_attr/2, encode_request/1, encode_reply_request/1, decode_request/2, decode_request/3, decode_request_id/1]).
+-export([del_attr/2, get_attr/2, encode_request/1, encode_reply/1, decode_request/2, decode_request/3, decode_request_id/1]).
 -export([random_authenticator/0, zero_authenticator/0, pad_to/2, set_attr/3, get_attributes/1, set_attributes/2]).
 -export([timestamp/0]).
 -export_type([command/0, secret/0, authenticator/0, attribute_list/0]).
+
+-compile(export_all).
 
 % -compile(bin_opt_info).
 
@@ -59,30 +61,33 @@ get_attr_loop(_, [])                                     -> undefined.
 %% -- Wire Encoding
 
 %% @doc Convert a RADIUS request to the wire format.
--spec encode_request(#radius_request{}) -> binary().
-encode_request(Req = #radius_request{cmd = Cmd})
-  when (Cmd == accreq) orelse
-       (Cmd == discreq) orelse
-       (Cmd == coareq) ->
-    encode_reply_request(Req);
-encode_request(Req = #radius_request{reqid = ReqID, cmd = Command, authenticator = Authenticator, attrs = Attributes}) ->
+-spec encode_request(#radius_request{}) -> {binary(), binary()}.
+encode_request(Req = #radius_request{reqid = ReqID, cmd = Command, attrs = Attributes}) when (Command == request) ->
     EncReq1 = encode_attributes(Req, Attributes),
     EncReq2 = encode_eap_message(Req, EncReq1),
-    {Body, BodySize} = encode_message_authenticator(Req, EncReq2),
-    <<(encode_command(Command)):8, ReqID:8, (BodySize + 20):16, Authenticator:16/binary, Body/binary>>.
-
-%% @doc Convert a RADIUS reply to the wire format.
-%%   This function performs the same task as {@link encode_request/2},
-%%   except that it includes the authenticator substitution required for replies.
--spec encode_reply_request(#radius_request{}) -> binary().
-encode_reply_request(Req = #radius_request{reqid = ReqID, cmd = Command, authenticator = Authenticator, attrs = Attributes}) ->
+    Authenticator = random_authenticator(),
+    {Body, BodySize} = encode_message_authenticator(Req#radius_request{authenticator = Authenticator}, EncReq2),
+    {Authenticator, <<(encode_command(Command)):8, ReqID:8, (BodySize + 20):16, Authenticator:16/binary, Body/binary>>};
+encode_request(Req = #radius_request{reqid = ReqID, cmd = Command, attrs = Attributes}) ->
     EncReq1 = encode_attributes(Req, Attributes),
     EncReq2 = encode_eap_message(Req, EncReq1),
     {Body, BodySize} = encode_message_authenticator(Req, EncReq2),
     Head = <<(encode_command(Command)):8, ReqID:8, (BodySize + 20):16>>,
-    ReqAuth = <<Authenticator:16/binary>>,
-    ReplyAuth = crypto:hash(md5, [Head, ReqAuth, Body, Req#radius_request.secret]),
-    <<Head/binary, ReplyAuth:16/binary, Body/binary>>.
+    ZeroAuthenticator = zero_authenticator(),
+    Authenticator = crypto:hash(md5, [Head, ZeroAuthenticator, Body, Req#radius_request.secret]),
+    {Authenticator, <<Head/binary, Authenticator:16/binary, Body/binary>>}.
+
+%% @doc Convert a RADIUS reply to the wire format.
+%%   This function performs the same task as {@link encode_request/2},
+%%   except that it includes the authenticator substitution required for replies.
+-spec encode_reply(#radius_request{}) -> binary().
+encode_reply(Req = #radius_request{reqid = ReqID, cmd = Command, authenticator = RequestAuthenticator, attrs = Attributes}) ->
+    EncReq1 = encode_attributes(Req, Attributes),
+    EncReq2 = encode_eap_message(Req, EncReq1),
+    {Body, BodySize} = encode_message_authenticator(Req, EncReq2),
+    Head = <<(encode_command(Command)):8, ReqID:8, (BodySize + 20):16>>,
+    ReplyAuthenticator = crypto:hash(md5, [Head, <<RequestAuthenticator:16/binary>>, Body, Req#radius_request.secret]),
+    <<Head/binary, ReplyAuthenticator:16/binary, Body/binary>>.
 
 -spec encode_command(command()) -> byte().
 encode_command(request)   -> ?RAccess_Request;
@@ -243,19 +248,19 @@ decode_request0(<<Cmd:8, ReqId:8, Len:16, PacketAuthenticator:16/binary, Body0/b
     GivenBodySize  = Len - 20,
     Body = if
               ActualBodySize > GivenBodySize ->
+                  lager:error("[~p]: RADIUS packet malformed - false body size: ~p, expected: ~p", [ReqId, ActualBodySize, GivenBodySize]),
                   throw(bad_pdu);
               ActualBodySize == GivenBodySize ->
                   Body0;
               true ->
                   binary:part(Body0, 0, GivenBodySize)
            end,
-
     Command = decode_command(Cmd),
     PartialRequest = #radius_request{cmd = Command, reqid = ReqId, authenticator = PacketAuthenticator, secret = Secret, msg_hmac = false},
     DecodedState = decode_attributes(PartialRequest, RequestAuthenticator, Body),
     Request = PartialRequest#radius_request{attrs = lists:reverse(DecodedState#decoder_state.attrs),
 					    eap_msg = list_to_binary(lists:reverse(DecodedState#decoder_state.eap_msg))},
-    validate_authenticator(Command, <<Cmd:8, ReqId:8, Len:16>>, PacketAuthenticator, Body, Secret),
+    validate_authenticator(Command, ReqId, <<Cmd:8, ReqId:8, Len:16>>, RequestAuthenticator, PacketAuthenticator, Body, Secret),
     if
 	is_integer(DecodedState#decoder_state.hmac_pos) ->
 	    validate_packet_authenticator(Cmd, ReqId, Len, Body, DecodedState#decoder_state.hmac_pos, Secret, PacketAuthenticator, RequestAuthenticator),
@@ -272,18 +277,36 @@ validate_packet_authenticator(Cmd, ReqId, Len, Body, Pos, Secret, _PacketAuthent
 -spec validate_packet_authenticator(non_neg_integer(), non_neg_integer(), non_neg_integer(), authenticator(), non_neg_integer(), binary(), binary()) -> ok.
 validate_packet_authenticator(Cmd, ReqId, Len, Auth, Body, Pos, Secret) ->
     case Body of
-	<<Before:Pos/bytes, Value:16/bytes, After/binary>> ->
-	    case crypto:hmac(md5, Secret, [<<Cmd:8, ReqId:8, Len:16>>, Auth, Before, zero_authenticator(), After]) of
-		Value -> ok;
-		_     -> throw(bad_pdu)
-	    end;
-	_ ->
-	    throw(bad_pdu)
+        <<Before:Pos/bytes, Value:16/bytes, After/binary>> ->
+            case crypto:hmac(md5, Secret, [<<Cmd:8, ReqId:8, Len:16>>, Auth, Before, zero_authenticator(), After]) of
+            Value -> 
+                ok;
+            _     -> 
+                lager:error("[~p]: RADIUS Message-Authenticator Attribute is invalid", [ReqId]),
+                throw(bad_pdu)
+            end;
+        _ ->
+            lager:error("[~p]: RADIUS Message-Authenticator Attribute is malformed", [ReqId]),
+            throw(bad_pdu)
     end.
 
-validate_authenticator(accreq, Head, PacketAuthenticator, Body, Secret) ->
-    crypto:hash(md5, [Head, zero_authenticator(), Body, Secret]) == PacketAuthenticator orelse throw(bad_pdu);
-validate_authenticator(_, _Head, _PacketAuthenticator, _Body, _Secret) -> true.
+validate_authenticator(accreq, ReqId, Head, _RequestAuthenticator, PacketAuthenticator, Body, Secret) ->
+    compare_authenticator(ReqId, crypto:hash(md5, [Head, zero_authenticator(), Body, Secret]), PacketAuthenticator);
+validate_authenticator(Cmd, ReqId, Head, RequestAuthenticator, PacketAuthenticator, Body, Secret)
+    when 
+        (Cmd =:= accept)  orelse
+        (Cmd =:= reject)  orelse
+        (Cmd =:= accresp) orelse
+        (Cmd =:= challenge) ->
+    compare_authenticator(ReqId, crypto:hash(md5, [Head, RequestAuthenticator, Body, Secret]), PacketAuthenticator);
+validate_authenticator(_Cmd, _ReqId, _Head, _RequestAuthenticator, _PacketAuthenticator, _Body, _Secret) -> 
+    true.
+
+compare_authenticator(_ReqId, Authenticator, Authenticator) -> 
+    true;
+compare_authenticator(ReqId, _RequestAuthenticator, _PacketAuthenticator) ->
+    lager:error("[~p]: RADIUS Authenticator Attribute is invalid", [ReqId]),
+    throw(bad_pdu).
 
 -spec decode_command(byte()) -> command().
 decode_command(?RAccess_Request)      -> request;
